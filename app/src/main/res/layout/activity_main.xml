@@ -43,7 +43,7 @@
             android:textColor="#aaaaaa" />
 
         <!-- Switch ON/OFF -->
-        <androidx.appcompat.widget.SwitchCompat
+        <Switch
             android:id="@+id/switchLinterna"
             android:layout_width="wrap_content"
             android:layout_height="60dp"
