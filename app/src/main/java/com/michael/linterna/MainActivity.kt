@@ -9,8 +9,6 @@ import android.hardware.camera2.CameraManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.SeekBar
@@ -28,6 +26,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var seekBrillo: SeekBar
     private lateinit var tvBrillo: TextView
     private lateinit var tvEstado: TextView
+    private lateinit var layoutBrillo: android.view.View
     private lateinit var btnFacebook: Button
     private lateinit var btnTelegram: Button
     private lateinit var btnWhatsApp: Button
@@ -37,23 +36,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cameraManager: CameraManager
     private var cameraId: String? = null
     private var encendida = false
-    private var nivelActual = 50
+    private var nivelBrillo = 80
 
-    // Native brightness (Android 13+ via reflection)
-    private var maxStrengthLevel = 1
-    private var soportaBrilloNativo = false
-    private val handler = Handler(Looper.getMainLooper())
+    // Native brightness (Android 13+ API pública)
+    private var brilloNativo = false
+    private var maxStrength = 1
 
     // Root mode
-    private var rootModeActivo = false
+    private var rootMode = false
     private lateinit var prefs: SharedPreferences
 
-    // Reflection methods
-    private var setTorchStrengthMethod: java.lang.reflect.Method? = null
-    private var getMaxStrengthMethod: java.lang.reflect.Method? = null
-
     companion object {
-        private val SYSFS_PATHS = arrayOf(
+        private val SYSFS = arrayOf(
             "/sys/class/leds/flashlight/brightness",
             "/sys/class/leds/led:torch_0/brightness",
             "/sys/class/leds/torch_flash/brightness",
@@ -70,6 +64,7 @@ class MainActivity : AppCompatActivity() {
         seekBrillo = findViewById(R.id.seekBrillo)
         tvBrillo = findViewById(R.id.tvBrillo)
         tvEstado = findViewById(R.id.tvEstado)
+        layoutBrillo = findViewById(R.id.layoutBrillo)
         btnFacebook = findViewById(R.id.btnFacebook)
         btnTelegram = findViewById(R.id.btnTelegram)
         btnWhatsApp = findViewById(R.id.btnWhatsApp)
@@ -78,15 +73,22 @@ class MainActivity : AppCompatActivity() {
         prefs = getSharedPreferences("linterna_prefs", MODE_PRIVATE)
         cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
-        // Detectar flash y capacidades via reflection total
-        detectarFlashYCapacidades()
+        // Detectar flash
+        detectarFlash()
 
         // Cargar preferencias
-        rootModeActivo = prefs.getBoolean("root_mode", false)
-        nivelActual = prefs.getInt("brillo", 50)
+        rootMode = prefs.getBoolean("root_mode", false)
+        nivelBrillo = prefs.getInt("brillo", 80)
 
-        // Configurar SeekBar
-        configurarSeekBar()
+        // Configurar SeekBar de 0 a 100
+        seekBrillo.max = 100
+        seekBrillo.progress = nivelBrillo
+        tvBrillo.text = "Brillo: ${nivelBrillo}%"
+        // Slider siempre activo para preconfigurar brillo
+        seekBrillo.isEnabled = true
+
+        // Mostrar/ocultar slider según soporte nativo
+        checkBrilloVisibility()
 
         // Switch
         switchLinterna.setOnCheckedChangeListener { _, isChecked ->
@@ -97,104 +99,87 @@ class MainActivity : AppCompatActivity() {
         seekBrillo.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                 if (!fromUser) return
-                nivelActual = p
-                actualizarLabelBrillo()
+                nivelBrillo = p
+                tvBrillo.text = "Brillo: ${p}%"
                 prefs.edit().putInt("brillo", p).apply()
-                if (encendida) aplicarIntensidad(p)
+                if (encendida) cambiarBrillo(p)
             }
             override fun onStartTrackingTouch(s: SeekBar?) {}
             override fun onStopTrackingTouch(s: SeekBar?) {}
         })
 
-        // Long press → Advanced config
+        // Long press → Root config
         tvEstado.setOnLongClickListener {
-            mostrarDialogoAvanzado()
+            mostrarConfigRoot()
             true
         }
 
-        // Contact buttons
-        btnFacebook.setOnClickListener { abrirUrl("https://www.facebook.com/share/1FvH35yGTn/") }
-        btnTelegram.setOnClickListener { abrirUrl("https://t.me/Michael_Antonio_Rodriguez") }
-        btnWhatsApp.setOnClickListener { abrirUrl("https://wa.me/message/IABPSKHOKNXLL1") }
-        btnYouTube.setOnClickListener { abrirUrl("https://youtube.com/@androidmovil?si=o3AxSWrl1_R2H5us") }
+        // Contacto
+        btnFacebook.setOnClickListener { abrir("https://www.facebook.com/share/1FvH35yGTn/") }
+        btnTelegram.setOnClickListener { abrir("https://t.me/Michael_Antonio_Rodriguez") }
+        btnWhatsApp.setOnClickListener { abrir("https://wa.me/message/IABPSKHOKNXLL1") }
+        btnYouTube.setOnClickListener { abrir("https://youtube.com/@androidmovil?si=o3AxSWrl1_R2H5us") }
     }
 
     // =========================================================================
-    // DETECCIÓN — TOTAL VIA REFLECTION
+    // DETECCIÓN
     // =========================================================================
 
-    private fun detectarFlashYCapacidades() {
+    private fun detectarFlash() {
         try {
             for (id in cameraManager.cameraIdList) {
                 val chars = cameraManager.getCameraCharacteristics(id)
-                val flashAvailable = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
-                if (flashAvailable) {
+                if (chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true) {
                     cameraId = id
-
-                    // Intentar obtener FLASH_INFO_STRENGTH_MAXIMUM via reflection
+                    // Android 13+ API pública para brillo nativo
                     if (Build.VERSION.SDK_INT >= 33) {
-                        try {
-                            val keyField = CameraCharacteristics::class.java
-                                .getDeclaredField("FLASH_INFO_STRENGTH_MAXIMUM")
-                            keyField.isAccessible = true
-                            val keyObj = keyField.get(null) as? CameraCharacteristics.Key<*>
-                            if (keyObj != null) {
-                                val getMethod = CameraCharacteristics::class.java
-                                    .getMethod("get", CameraCharacteristics.Key::class.java)
-                                val result = getMethod.invoke(chars, keyObj)
-                                if (result is Int && result > 1) {
-                                    maxStrengthLevel = result
-                                    soportaBrilloNativo = true
+                        val fieldNames = arrayOf(
+                            "FLASH_INFO_STRENGTH_MAX_LEVEL",
+                            "FLASH_INFO_STRENGTH_MAXIMUM_LEVEL"
+                        )
+                        for (name in fieldNames) {
+                            try {
+                                val field = CameraCharacteristics::class.java.getField(name)
+                                val key = field.get(null)
+                                if (key is CameraCharacteristics.Key<*>) {
+                                    @Suppress("UNCHECKED_CAST")
+                                    val maxLevel = chars.get(key as CameraCharacteristics.Key<Int>)
+                                    if (maxLevel != null && maxLevel > 1) {
+                                        maxStrength = maxLevel
+                                        brilloNativo = true
+                                        break
+                                    }
                                 }
-                            }
-                        } catch (_: Exception) {}
-
-                        // Obtener método setTorchStrengthLevel via reflection
-                        try {
-                            setTorchStrengthMethod = CameraManager::class.java
-                                .getMethod("setTorchStrengthLevel", String::class.java, Int::class.java)
-                        } catch (_: Exception) {}
+                            } catch (_: Exception) {}
+                        }
                     }
                     break
                 }
             }
-        } catch (e: Exception) {
-            mostrarEstado("⚠️ Error: ${e.message}")
-        }
+        } catch (_: Exception) {}
 
         if (cameraId == null) {
-            mostrarEstado("⚠️ No se detectó flash")
+            tvEstado.text = "❌ No se detectó flash en el dispositivo"
             switchLinterna.isEnabled = false
             seekBrillo.isEnabled = false
         }
     }
 
-    // =========================================================================
-    // SEEK BAR
-    // =========================================================================
-
-    private fun configurarSeekBar() {
-        if (rootModeActivo && verificarRoot()) {
-            seekBrillo.max = 100
-            seekBrillo.progress = nivelActual.coerceIn(0, 100)
-            seekBrillo.isEnabled = false
-            mostrarEstado("🔧 Modo Root activo")
-            actualizarLabelBrillo()
-            return
-        }
-
-        if (soportaBrilloNativo && setTorchStrengthMethod != null) {
-            seekBrillo.max = maxStrengthLevel
-            seekBrillo.progress = nivelActual.coerceIn(0, maxStrengthLevel)
-            seekBrillo.isEnabled = false
-            mostrarEstado("💡 Brillo nativo disponible")
+    private fun checkBrilloVisibility() {
+        if (rootMode) {
+            layoutBrillo.visibility = android.view.View.VISIBLE
+            seekBrillo.isEnabled = true
+            tvEstado.text = "🔧 Modo Root activo | Control total de brillo"
+        } else if (brilloNativo) {
+            layoutBrillo.visibility = android.view.View.VISIBLE
+            seekBrillo.isEnabled = true
+            tvEstado.text = "✨ Brillo ajustable disponible | Arrastra para cambiar intensidad"
         } else {
-            seekBrillo.max = 1
-            seekBrillo.progress = if (nivelActual > 0) 1 else 0
-            seekBrillo.isEnabled = false
-            mostrarEstado("ℹ️ Ajuste fino no compatible")
+            layoutBrillo.visibility = android.view.View.GONE
+            if (cameraId != null) {
+                tvEstado.text = "ℹ️ Brillo graduado no soportado en este dispositivo"
+            }
         }
-        actualizarLabelBrillo()
     }
 
     // =========================================================================
@@ -202,112 +187,87 @@ class MainActivity : AppCompatActivity() {
     // =========================================================================
 
     private fun encender() {
-        val id = cameraId ?: return
         try {
-            if (rootModeActivo) {
-                val ok = escribirSysfs(nivelActual.coerceIn(0, 100))
-                if (ok) {
-                    encendida = true
-                    seekBrillo.isEnabled = true
-                    mostrarEstado("🔦 Root: ENCENDIDA")
-                    tvEstado.setTextColor(0xFFFFDD00.toInt())
-                } else {
-                    mostrarEstado("❌ Root: fallo. Revisa permisos.")
-                    switchLinterna.isChecked = false
-                    rootModeActivo = false
-                    prefs.edit().putBoolean("root_mode", false).apply()
-                    configurarSeekBar()
-                }
-                return
-            }
+            val id = cameraId ?: return
 
-            if (soportaBrilloNativo && setTorchStrengthMethod != null) {
-                val nivel = nivelActual.coerceIn(0, maxStrengthLevel)
+            if (brilloNativo && Build.VERSION.SDK_INT >= 33) {
+                val nivel = (nivelBrillo * maxStrength / 100).coerceIn(1, maxStrength)
                 try {
-                    setTorchStrengthMethod!!.invoke(cameraManager, id, nivel)
-                } catch (_: Exception) {}
-                cameraManager.setTorchMode(id, true)
-            } else {
-                if (nivelActual <= 0) {
-                    mostrarEstado("Sube el brillo para encender")
-                    switchLinterna.isChecked = false
-                    return
+                    val metodo = CameraManager::class.java
+                        .getMethod("turnOnTorchWithStrengthLevel", String::class.java, Int::class.java)
+                    metodo.invoke(cameraManager, id, nivel)
+                } catch (e1: Exception) {
+                    cameraManager.setTorchMode(id, true)
                 }
+            } else if (rootMode) {
+                cameraManager.setTorchMode(id, true)
+                escribirSysfs(nivelBrillo)
+            } else {
                 cameraManager.setTorchMode(id, true)
             }
 
             encendida = true
             seekBrillo.isEnabled = true
-            mostrarEstado("🔦 Linterna: ENCENDIDA")
+            tvEstado.text = "🔦 Linterna: ENCENDIDA"
             tvEstado.setTextColor(0xFFFFDD00.toInt())
 
         } catch (e: Exception) {
-            mostrarEstado("⚠️ Error: ${e.message}")
+            tvEstado.text = "⚠️ Error: ${e.message}"
+            tvEstado.setTextColor(0xFFFF4444.toInt())
             encendida = false
             switchLinterna.isChecked = false
-            seekBrillo.isEnabled = false
         }
     }
 
     private fun apagar() {
         try {
             val id = cameraId ?: return
-            if (rootModeActivo) escribirSysfs(0)
+            if (rootMode) escribirSysfs(0)
             else cameraManager.setTorchMode(id, false)
             encendida = false
-            seekBrillo.isEnabled = false
-            mostrarEstado("🔦 Linterna: APAGADA")
+            seekBrillo.isEnabled = true
+            tvEstado.text = "🔦 Linterna: APAGADA"
             tvEstado.setTextColor(0xFFaaaaaa.toInt())
         } catch (e: Exception) {
-            mostrarEstado("⚠️ Error: ${e.message}")
+            tvEstado.text = "⚠️ Error: ${e.message}"
         }
     }
 
     // =========================================================================
-    // APLICAR INTENSIDAD
+    // CAMBIAR BRILLO
     // =========================================================================
 
-    private fun aplicarIntensidad(progress: Int) {
+    private fun cambiarBrillo(porcentaje: Int) {
         if (!encendida) return
         try {
             val id = cameraId ?: return
-            if (rootModeActivo) {
-                escribirSysfs(progress.coerceIn(0, 100))
+            if (rootMode) {
+                escribirSysfs(porcentaje)
                 return
             }
-            if (soportaBrilloNativo && setTorchStrengthMethod != null) {
-                val nivel = progress.coerceIn(0, maxStrengthLevel)
+            if (brilloNativo && Build.VERSION.SDK_INT >= 33) {
+                val nivel = (porcentaje * maxStrength / 100).coerceIn(1, maxStrength)
                 try {
-                    setTorchStrengthMethod!!.invoke(cameraManager, id, nivel)
+                    val metodo = CameraManager::class.java
+                        .getMethod("turnOnTorchWithStrengthLevel", String::class.java, Int::class.java)
+                    metodo.invoke(cameraManager, id, nivel)
                 } catch (_: Exception) {}
-                cameraManager.setTorchMode(id, true)
-            } else {
-                if (progress <= 0) {
-                    cameraManager.setTorchMode(id, false)
-                    encendida = false
-                    switchLinterna.isChecked = false
-                    seekBrillo.isEnabled = false
-                    mostrarEstado("🔦 Linterna: APAGADA")
-                    tvEstado.setTextColor(0xFFaaaaaa.toInt())
-                } else {
-                    cameraManager.setTorchMode(id, true)
-                }
             }
         } catch (_: Exception) {}
     }
 
     // =========================================================================
-    // MODO ROOT — SYSFS
+    // ROOT
     // =========================================================================
 
     private fun escribirSysfs(porcentaje: Int): Boolean {
         val valor = (porcentaje * 255 / 100).coerceIn(0, 255)
-        for (ruta in SYSFS_PATHS) {
+        for (ruta in SYSFS) {
             try {
-                val proc = Runtime.getRuntime().exec(arrayOf("su", "-c",
-                    "chmod 666 $ruta 2>/dev/null; echo $valor > $ruta"))
-                val code = proc.waitFor()
-                if (code == 0) {
+                val proc = Runtime.getRuntime().exec(
+                    arrayOf("su", "-c", "chmod 666 $ruta 2>/dev/null; echo $valor > $ruta")
+                )
+                if (proc.waitFor() == 0) {
                     val err = BufferedReader(InputStreamReader(proc.errorStream)).readText()
                     if (err.isBlank()) return true
                 }
@@ -326,62 +286,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // DIÁLOGO AVANZADO
+    // CONFIGURACIÓN AVANZADA
     // =========================================================================
 
-    private fun mostrarDialogoAvanzado() {
+    private fun mostrarConfigRoot() {
         val rootOK = verificarRoot()
         val cb = CheckBox(this)
-        cb.text = if (rootOK) "Forzar control por hardware (Root)"
-                   else "❌ Root no detectado"
-        cb.isChecked = rootModeActivo
+        cb.isChecked = rootMode
         cb.isEnabled = rootOK
+        cb.text = if (rootOK) "Forzar control por hardware (Root)"
+                  else "❌ Root no detectado en este dispositivo"
 
-        val builder = AlertDialog.Builder(this)
-        builder.setTitle("⚙️ Configuración Avanzada")
-        builder.setView(cb)
-        builder.setPositiveButton("Aceptar") { _, _ ->
-            if (cb.isChecked && !rootOK) {
-                mostrarEstado("❌ Root no disponible")
-                return@setPositiveButton
+        AlertDialog.Builder(this)
+            .setTitle("⚙️ Configuración Avanzada")
+            .setView(cb)
+            .setPositiveButton("Aceptar") { _, _ ->
+                if (cb.isChecked && !rootOK) {
+                    tvEstado.text = "❌ Root no disponible"
+                    return@setPositiveButton
+                }
+                if (cb.isChecked != rootMode) {
+                    rootMode = cb.isChecked
+                    prefs.edit().putBoolean("root_mode", rootMode).apply()
+                    if (encendida) { apagar(); switchLinterna.isChecked = false }
+                    checkBrilloVisibility()
+                    tvEstado.text = if (rootMode) "🔧 Modo Root activado" else "ℹ️ Modo Normal"
+                }
             }
-            if (cb.isChecked != rootModeActivo) {
-                rootModeActivo = cb.isChecked
-                prefs.edit().putBoolean("root_mode", rootModeActivo).apply()
-                if (encendida) { apagar(); switchLinterna.isChecked = false }
-                configurarSeekBar()
-                mostrarEstado(if (rootModeActivo) "🔧 Modo Root" else "ℹ️ Modo Normal")
-            }
-        }
-        builder.setNegativeButton("Cancelar", null)
-        builder.show()
+            .setNegativeButton("Cancelar", null)
+            .show()
     }
 
     // =========================================================================
     // UTILERÍAS
     // =========================================================================
 
-    private fun actualizarLabelBrillo() {
-        tvBrillo.text = when {
-            rootModeActivo -> "Brillo: ${nivelActual}% (Root)"
-            soportaBrilloNativo -> {
-                val pct = (nivelActual * 100 / maxStrengthLevel).coerceIn(0, 100)
-                "Brillo: ${pct}% (${nivelActual}/${maxStrengthLevel})"
-            }
-            else -> if (nivelActual > 0) "Brillo: 100% (ON)" else "Brillo: 0% (OFF)"
-        }
-    }
-
-    private fun mostrarEstado(msg: String) {
-        tvEstado.text = msg
-        handler.postDelayed({
-            tvEstado.text = if (encendida) "🔦 Linterna: ENCENDIDA"
-                            else "🔦 Linterna: APAGADA"
-            tvEstado.setTextColor(if (encendida) 0xFFFFDD00.toInt() else 0xFFaaaaaa.toInt())
-        }, 4000)
-    }
-
-    private fun abrirUrl(url: String) {
+    private fun abrir(url: String) {
         try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
         catch (_: Exception) { Toast.makeText(this, "Error al abrir enlace", Toast.LENGTH_SHORT).show() }
     }
@@ -389,7 +329,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         if (encendida) {
             try {
-                if (rootModeActivo) escribirSysfs(0)
+                if (rootMode) escribirSysfs(0)
                 else cameraId?.let { cameraManager.setTorchMode(it, false) }
             } catch (_: Exception) {}
         }
