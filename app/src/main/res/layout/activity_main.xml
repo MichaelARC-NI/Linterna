@@ -29,7 +29,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginBottom="8dp"
-            android:text="by Michael Antonio Rodríguez"
+            android:text="by Michael Antonio Rodriguez Condega"
             android:textSize="13sp"
             android:textColor="#888888" />
 
